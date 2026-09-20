@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"net/http"
+	"net/url"
 )
 
 func main() {
@@ -28,12 +29,31 @@ func handleSubscription(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	mode := r.PostForm.Get("hub.mode")
+	if mode != "subscribe" {
+		http.Error(w, "Invalid Hub Mode", http.StatusBadRequest)
+		return
+	}
+
+	topic := r.PostForm.Get("hub.topic")
+	callback := r.PostForm.Get("hub.callback")
+	secret := r.PostForm.Get("hub.secret")
+
+	if topic == "" || callback == "" || secret == "" {
+		http.Error(w, "Missing Subscription Data", http.StatusBadRequest)
+		return
+	}
+
+	callbackURL, err := url.Parse(callback)
+	if err != nil || (callbackURL.Scheme != "http" && callbackURL.Scheme != "https") || callbackURL.Host == "" {
+		http.Error(w, "Invalid Callback URL", http.StatusBadRequest)
+		return
+	}
+
 	fmt.Printf(
-		"request mode=%q topic=%q callback=%q has_secret=%t\n",
-		r.PostForm.Get("hub.mode"),
-		r.PostForm.Get("hub.topic"),
-		r.PostForm.Get("hub.callback"),
-		r.PostForm.Get("hub.secret") != "",
+		"Subscription request topic=%q callback=%q\n",
+		topic,
+		callback,
 	)
 
 	w.WriteHeader(http.StatusAccepted)
