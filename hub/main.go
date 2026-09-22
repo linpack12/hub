@@ -1,8 +1,12 @@
 package main
 
 import (
+	"bytes"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -43,7 +47,8 @@ func main() {
 		subscriptions: make(map[subscriptionKey]subscription),
 	}
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", h.handleSubscription)
+	mux.HandleFunc("POST /{$}", h.handleSubscription)
+	mux.HandleFunc("POST /publish", h.handlePublish)
 
 	fmt.Println("Hub listening on :8080")
 
@@ -53,12 +58,6 @@ func main() {
 }
 
 func (h *hub) handleSubscription(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		w.Header().Set("Allow", http.MethodPost)
-		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "Invalid Form Data", http.StatusBadRequest)
 		return
@@ -100,6 +99,67 @@ func (h *hub) handleSubscription(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusAccepted)
 
 	go h.verifySubscription(sub)
+}
+
+func (h *hub) handlePublish(w http.ResponseWriter, r *http.Request) {
+	payload, err := json.Marshal(map[string]string{
+		"message": "hello from hub",
+	})
+	if err != nil {
+		http.Error(w, "Error generating payload", http.StatusInternalServerError)
+		return
+	}
+
+	now := time.Now()
+
+	h.mu.Lock()
+	subs := make([]subscription, 0, len(h.subscriptions))
+	for key, sub := range h.subscriptions {
+		if !now.Before(sub.ExpiresAt) {
+			delete(h.subscriptions, key)
+			continue
+		}
+		subs = append(subs, sub)
+	}
+	h.mu.Unlock()
+
+	delivered := 0
+
+	for _, sub := range subs {
+		if err := h.deliver(sub, payload); err != nil {
+			fmt.Printf("delivery failed callback=%q error=%v\n", sub.Callback, err)
+			continue
+		}
+		delivered++
+	}
+
+	fmt.Fprintf(w, "Published to %d subscribers\n", delivered)
+}
+
+func (h *hub) deliver(sub subscription, payload []byte) error {
+	mac := hmac.New(sha256.New, []byte(sub.Secret))
+	mac.Write(payload)
+	signature := "sha256=" + hex.EncodeToString(mac.Sum(nil))
+
+	req, err := http.NewRequest(http.MethodPost, sub.Callback, bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Hub-Signature", signature)
+
+	resp, err := h.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("subscriber returned status %d", resp.StatusCode)
+	}
+
+	return nil
 }
 
 func (h *hub) verifySubscription(sub subscription) {
